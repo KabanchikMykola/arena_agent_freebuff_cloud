@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import ssl
 import sys
 import time
@@ -19,6 +20,16 @@ from typing import Any
 TIMEOUT_SECONDS = 10
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REPORT_PATH = Path(__file__).with_name("report.json")
+
+GITHUB_API = "https://api.github.com"
+# Small, stable dataset used to prove that GitHub can transport real market data.
+GITHUB_SAMPLE_DATASET = ("datasets/finance-vix", "data/vix-daily.csv")
+# Tiny repository archive, downloaded from codeload.github.com.
+GITHUB_SAMPLE_ARCHIVE = "https://codeload.github.com/octocat/Hello-World/zip/refs/heads/master"
+GITHUB_CODE_SEARCH_QUERY = "BTCUSDT extension:csv"  # needs a token
+GITHUB_REPO_SEARCH_QUERY = "binance historical data csv"  # works unauthenticated
+PYPI_SAMPLE_PACKAGE = "statsmodels"  # ships CSV datasets and has a small sdist
+NPM_SAMPLE_PACKAGE = "vega-datasets"  # ships CSV/JSON datasets in the tarball
 
 
 def _platform_ca_bundle() -> str | bool:
@@ -38,13 +49,32 @@ class DiagnosticError(RuntimeError):
     """An endpoint responded, but not with usable diagnostic data."""
 
 
-def _get_json(url: str, *, params: dict[str, Any] | None = None) -> tuple[Any, int]:
+def _github_headers(*, raw: bool = False) -> dict[str, str]:
+    """GitHub API headers; the optional token only raises the rate limit."""
+    headers = {
+        "Accept": (
+            "application/vnd.github.raw" if raw else "application/vnd.github+json"
+        )
+    }
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _get_json(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[Any, int]:
     """GET JSON with a bounded HTTP timeout; requests is imported lazily."""
     import requests
 
     response = requests.get(
         url,
         params=params,
+        headers=headers,
         timeout=TIMEOUT_SECONDS,
         verify=TLS_CA_BUNDLE,
     )
@@ -61,10 +91,138 @@ def _iso_from_milliseconds(value: Any) -> str | None:
 
 
 def check_github_api() -> dict[str, Any]:
-    payload, status = _get_json("https://api.github.com")
+    payload, status = _get_json(GITHUB_API, headers=_github_headers())
     if not isinstance(payload, dict):
         raise DiagnosticError("unexpected response from GitHub API")
     return {"http_status": status}
+
+
+def check_github_dataset_transport() -> dict[str, Any]:
+    """Fetch a real market dataset through the GitHub Contents API (raw media type).
+
+    GitHub is reachable from this sandbox while market-data hosts are not, so the
+    Contents API is the supported way to transport historical data.
+    """
+    import requests
+
+    repository, path = GITHUB_SAMPLE_DATASET
+    response = requests.get(
+        f"{GITHUB_API}/repos/{repository}/contents/{path}",
+        headers=_github_headers(raw=True),
+        timeout=TIMEOUT_SECONDS,
+        verify=TLS_CA_BUNDLE,
+    )
+    response.raise_for_status()
+    lines = response.text.splitlines()
+    if len(lines) < 100 or not lines[0].upper().startswith("DATE"):
+        raise DiagnosticError("unexpected dataset content")
+    return {
+        "http_status": response.status_code,
+        "repository": f"{repository}/{path}",
+        "bytes": len(response.content),
+        "rows": len(lines) - 1,
+        "first_date": lines[1].split(",")[0],
+        "last_date": lines[-1].split(",")[0],
+    }
+
+
+def check_github_dataset_search() -> dict[str, Any]:
+    """Search GitHub for CSV datasets, the discovery path for historical data.
+
+    Code search finds the actual CSV files but requires a token; without one the
+    check falls back to repository search, which works unauthenticated.
+    """
+    has_token = bool(os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
+    if has_token:
+        endpoint, query, mode = "code", GITHUB_CODE_SEARCH_QUERY, "code"
+    else:
+        endpoint, query, mode = "repositories", GITHUB_REPO_SEARCH_QUERY, "repositories"
+
+    payload, status = _get_json(
+        f"{GITHUB_API}/search/{endpoint}",
+        params={"q": query, "per_page": 3},
+        headers=_github_headers(),
+    )
+    if not isinstance(payload, dict) or "total_count" not in payload:
+        raise DiagnosticError("unexpected search response")
+    samples = [
+        item["repository"]["full_name"] if mode == "code" else item["full_name"]
+        for item in payload.get("items", [])[:3]
+    ]
+    return {
+        "http_status": status,
+        "mode": mode,
+        "query": query,
+        "total_count": payload["total_count"],
+        "samples": ", ".join(samples),
+    }
+
+
+def check_github_archive_transport() -> dict[str, Any]:
+    """Download a small repository archive from codeload.github.com."""
+    import requests
+
+    response = requests.get(
+        GITHUB_SAMPLE_ARCHIVE, timeout=TIMEOUT_SECONDS, verify=TLS_CA_BUNDLE
+    )
+    response.raise_for_status()
+    if not response.content.startswith(b"PK"):
+        raise DiagnosticError("unexpected archive content")
+    return {"http_status": response.status_code, "bytes": len(response.content)}
+
+
+def check_pypi_package() -> dict[str, Any]:
+    """Read package metadata from PyPI; packages may ship CSV/Parquet fixtures."""
+    payload, status = _get_json(f"https://pypi.org/pypi/{PYPI_SAMPLE_PACKAGE}/json")
+    if not isinstance(payload, dict) or "info" not in payload:
+        raise DiagnosticError("unexpected PyPI response")
+    return {
+        "http_status": status,
+        "package": payload["info"]["name"],
+        "version": payload["info"]["version"],
+        "files": len(payload.get("urls", [])),
+    }
+
+
+def check_pypi_artifact() -> dict[str, Any]:
+    """Confirm that files.pythonhosted.org serves package artifacts (data payloads)."""
+    import requests
+
+    payload, _ = _get_json(f"https://pypi.org/pypi/{PYPI_SAMPLE_PACKAGE}/json")
+    files = payload.get("urls") or []
+    if not files:
+        raise DiagnosticError("PyPI returned no distribution files")
+    sdists = [item for item in files if item.get("packagetype") == "sdist"]
+    artifact = min(sdists or files, key=lambda item: item.get("size") or float("inf"))
+    with requests.get(
+        str(artifact["url"]),
+        stream=True,
+        timeout=TIMEOUT_SECONDS,
+        verify=TLS_CA_BUNDLE,
+    ) as response:
+        response.raise_for_status()
+        status = response.status_code
+        size = response.headers.get("Content-Length") or artifact.get("size")
+    return {
+        "http_status": status,
+        "artifact": artifact["filename"],
+        "bytes": size,
+    }
+
+
+def check_npm_registry() -> dict[str, Any]:
+    """Check the npm registry; tarballs can carry bundled datasets as well."""
+    payload, status = _get_json(f"https://registry.npmjs.org/{NPM_SAMPLE_PACKAGE}")
+    if not isinstance(payload, dict) or "dist-tags" not in payload:
+        raise DiagnosticError("unexpected npm registry response")
+    latest = payload["dist-tags"]["latest"]
+    tarball = str(payload["versions"][latest]["dist"]["tarball"])
+    return {
+        "http_status": status,
+        "package": NPM_SAMPLE_PACKAGE,
+        "version": latest,
+        "tarball_host": tarball.split("/")[2] if "//" in tarball else tarball,
+    }
 
 
 def check_binance_spot_ping() -> dict[str, Any]:
@@ -215,6 +373,24 @@ def check_yfinance_aapl() -> dict[str, Any]:
 
 CHECKS: tuple[tuple[str, str, Callable[[], dict[str, Any]]], ...] = (
     ("GitHub API", "Internet", check_github_api),
+    (
+        "GitHub: датасет через Contents API (raw)",
+        "GitHub datasets",
+        check_github_dataset_transport,
+    ),
+    (
+        "GitHub: поиск датасетов (search API)",
+        "GitHub datasets",
+        check_github_dataset_search,
+    ),
+    (
+        "GitHub: архив репозитория (codeload)",
+        "GitHub datasets",
+        check_github_archive_transport,
+    ),
+    ("PyPI: метаданные пакета", "PyPI", check_pypi_package),
+    ("PyPI: файл пакета (files.pythonhosted.org)", "PyPI", check_pypi_artifact),
+    ("npm: метаданные пакета", "npm", check_npm_registry),
     ("Binance Spot: ping", "Binance Spot", check_binance_spot_ping),
     ("Binance Spot: BTCUSDT 1d candle", "Binance Spot", check_binance_spot_candles),
     ("Binance Futures: ping", "Binance Futures", check_binance_futures_ping),
@@ -238,6 +414,9 @@ CHECKS: tuple[tuple[str, str, Callable[[], dict[str, Any]]], ...] = (
 
 SOURCE_GROUPS: tuple[tuple[str, str], ...] = (
     ("GitHub / internet", "Internet"),
+    ("GitHub-транспорт данных (Contents API, search, codeload)", "GitHub datasets"),
+    ("PyPI (метаданные и файлы пакетов)", "PyPI"),
+    ("npm registry", "npm"),
     ("Binance Spot REST", "Binance Spot"),
     ("Binance Futures REST", "Binance Futures"),
     ("Binance derivative metrics", "Binance metrics"),
@@ -404,6 +583,19 @@ def _print_summary(summary: dict[str, Any]) -> None:
     )
     print(
         "  HTTP 451 обычно указывает на региональное ограничение; timeout/DNS чаще говорит о сетевой недоступности."
+    )
+    print("\nОткуда брать данные при таком egress:")
+    print(
+        "  Живые котировки недоступны — вызовы к биржам и агрегаторам обрываются на TLS."
+    )
+    print(
+        "  Рабочий транспорт исторических данных: GitHub (Contents API raw, search, "
+        "codeload/git clone), PyPI и npm."
+    )
+    print(
+        "  Пример: curl -H 'Accept: application/vnd.github.raw' "
+        f"https://api.github.com/repos/{GITHUB_SAMPLE_DATASET[0]}/contents/"
+        f"{GITHUB_SAMPLE_DATASET[1]} -o data/vix-daily.csv"
     )
 
 
