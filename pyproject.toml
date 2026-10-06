@@ -1,0 +1,14 @@
+[project]
+name = "freebuff-market-data-diagnostics"
+version = "0.1.0"
+description = "Diagnostics for public market-data sources used by Freebuff Cloud"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.4",
+    "requests>=2.31",
+    "yfinance>=0.2.40",
+]
+
+[tool.uv]
+# This repo runs scripts directly and is not distributed as an installable package.
+package = false

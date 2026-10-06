@@ -1,0 +1,13 @@
+# Local market data (keep the placeholder, not downloaded datasets)
+data/*.csv
+data/*.parquet
+
+# Python bytecode and environments
+__py__/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Runtime output of the diagnostics script
+backend/diagnostics/report.json
